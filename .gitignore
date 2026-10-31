@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Secrets and local configurations
+config.json
+*.env
+*.key
+*.tmp
+.config/
+
+# OS / Editor artifacts
+.DS_Store
+*.swp
+*~

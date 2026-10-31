@@ -1,0 +1,1671 @@
+#!/usr/bin/env python3
+"""
+Gmail Terminal & Headless CLI Client (gmail-tui)
+Navigate and manage Gmail directly from your terminal with zero external dependencies.
+Supports interactive TUI (curses) and headless CLI for scripting, automation, and AI agents.
+"""
+
+import os
+import sys
+import json
+import getpass
+import argparse
+import imaplib
+import smtplib
+import ssl
+import email
+import email.header
+import email.utils
+from email.message import EmailMessage
+import html
+import re
+import curses
+import subprocess
+import tempfile
+import shlex
+import termios
+
+CONFIG_DIR = os.path.expanduser("~/.config/gmail-tui")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+# ==============================================================================
+# Configuration & Setup
+# ==============================================================================
+
+DEFAULT_CONFIG = {
+    "email": "",
+    "app_password": "",
+    "imap_host": "imap.gmail.com",
+    "imap_port": 993,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+}
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if data.get("email") and data.get("app_password"):
+                return data
+    except Exception:
+        pass
+    return None
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+    temp_path = CONFIG_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(temp_path, CONFIG_FILE)
+
+def interactive_setup():
+    print("=" * 66)
+    print("           GMAIL TERMINAL - SETUP WIZARD")
+    print("=" * 66)
+    print("\nGoogle requires an 'App Password' for third-party terminal clients.")
+    print("You do NOT use your normal Google account password.\n")
+    print("How to get a 16-character Google App Password (takes 1 minute):")
+    print("  1. Turn ON 2-Step Verification on your Google Account.")
+    print("  2. Open: https://myaccount.google.com/apppasswords")
+    print("  3. Create an app named 'Gmail Terminal'.")
+    print("  4. Copy the generated 16-letter code (e.g. abcd efgh ijkl mnop).\n")
+    print("-" * 66)
+
+    email_addr = input("\nGmail Address: ").strip()
+    if not email_addr:
+        print("Setup cancelled.")
+        return None
+
+    pwd = getpass.getpass("App Password (16 characters): ").strip().replace(" ", "")
+    if not pwd:
+        print("Setup cancelled.")
+        return None
+
+    print("\nTesting connection to imap.gmail.com:993 ... ", end="", flush=True)
+    try:
+        context = ssl.create_default_context()
+        imap = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=context)
+        imap.login(email_addr, pwd)
+        imap.logout()
+        print("SUCCESS! \u2714")
+    except Exception as e:
+        print(f"FAILED \u2718\nError: {e}")
+        print("\nPlease check your email, App Password, and ensure IMAP is enabled in Gmail settings.")
+        return None
+
+    print("Testing connection to smtp.gmail.com:465 ... ", end="", flush=True)
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=10) as smtp:
+            smtp.login(email_addr, pwd)
+        print("SUCCESS! \u2714")
+    except Exception as e:
+        print(f"WARNING: SMTP check reported: {e}")
+
+    cfg = dict(DEFAULT_CONFIG)
+    cfg["email"] = email_addr
+    cfg["app_password"] = pwd
+    save_config(cfg)
+    print(f"\nConfiguration saved securely to {CONFIG_FILE}")
+    input("Press Enter to launch Gmail...")
+    return cfg
+
+# ==============================================================================
+# Helper Functions: Header & MIME Parsing
+# ==============================================================================
+
+def decode_mime_words(raw_header):
+    if not raw_header:
+        return ""
+    decoded_fragments = email.header.decode_header(raw_header)
+    parts = []
+    for fragment, encoding in decoded_fragments:
+        if isinstance(fragment, bytes):
+            try:
+                parts.append(fragment.decode(encoding or "utf-8", errors="replace"))
+            except Exception:
+                parts.append(fragment.decode("latin1", errors="replace"))
+        else:
+            parts.append(str(fragment))
+    return "".join(parts)
+
+def strip_html(html_text):
+    text = re.sub(r"(?i)<style.*?>.*?</style>", "", html_text, flags=re.DOTALL)
+    text = re.sub(r"(?i)<script.*?>.*?</script>", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p>", "\n\n", text)
+    text = re.sub(r"(?i)</div>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+def extract_body(msg):
+    text_content = ""
+    html_content = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            cdisp = str(part.get("Content-Disposition"))
+            if "attachment" in cdisp:
+                continue
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                decoded = payload.decode(charset, errors="replace")
+            except Exception:
+                decoded = payload.decode("latin1", errors="replace")
+
+            if ctype == "text/plain" and not text_content:
+                text_content = decoded
+            elif ctype == "text/html" and not html_content:
+                html_content = decoded
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            try:
+                decoded = payload.decode(charset, errors="replace")
+            except Exception:
+                decoded = payload.decode("latin1", errors="replace")
+            if msg.get_content_type() == "text/html":
+                html_content = decoded
+            else:
+                text_content = decoded
+
+    if text_content.strip():
+        return text_content.strip()
+    if html_content.strip():
+        return strip_html(html_content)
+    return "[No readable text body found]"
+
+# ==============================================================================
+# External Editor Integration
+# ==============================================================================
+
+def launch_external_editor(initial_text=""):
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding="utf-8") as tf:
+        tf.write(initial_text)
+        temp_path = tf.name
+
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nvim"
+
+    curses.def_prog_mode()
+    curses.endwin()
+
+    try:
+        cmd = shlex.split(editor) + [temp_path]
+        subprocess.call(cmd)
+    except Exception:
+        try:
+            subprocess.call(["nvim", temp_path])
+        except Exception:
+            pass
+    finally:
+        curses.resetprog_mode()
+
+    result = initial_text
+    try:
+        with open(temp_path, "r", encoding="utf-8") as f:
+            result = f.read()
+    except Exception:
+        pass
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+    return result
+
+# ==============================================================================
+# Mock Data for Demo Mode
+# ==============================================================================
+
+DEMO_EMAILS = [
+    {
+        "id": "1",
+        "flags": ["\\Seen"],
+        "sender": "GitHub Notifications <notifications@github.com>",
+        "reply_to": "",
+        "message_id": "<gh-sec-42@github.com>",
+        "references": "",
+        "subject": "[GitHub] Security advisory alert: dependencies updated in main",
+        "date": "Oct 30 18:24",
+        "body": "Hi,\n\nA new automated pull request has been opened on your repository to patch dependencies.\n\nReview changes: https://github.com/example/project/pull/42\nAll automated checks passed.\n\nBest,\nGitHub Security Team",
+    },
+    {
+        "id": "2",
+        "flags": [],
+        "sender": "Alice Walker <alice.walker@example.com>",
+        "reply_to": "alice.walker@example.com",
+        "message_id": "<call-sync-02@example.com>",
+        "references": "",
+        "subject": "Notes from today's architecture sync & next steps",
+        "date": "Oct 30 17:15",
+        "body": "Hey,\n\nThanks for hopping on the call earlier. Here are the key takeaways:\n\n1. Migration to async queue starts Monday.\n2. TUI client preview looks great—let's ship the demo mode first.\n3. Follow up with team by Thursday afternoon.\n\nLet me know if you want to adjust any timelines.\n\nCheers,\nAlice",
+    },
+    {
+        "id": "3",
+        "flags": ["\\Seen", "\\Flagged"],
+        "sender": "Google Cloud <no-reply@google.com>",
+        "reply_to": "",
+        "message_id": "<gcp-bill-99@google.com>",
+        "references": "",
+        "subject": "Monthly billing statement ready for download",
+        "date": "Oct 30 14:02",
+        "body": "Hello,\n\nYour monthly billing statement for the period ending October 30 is now available in the Google Cloud Console.\n\nTotal charges: $0.00 (Free tier credits applied).\n\nThank you for choosing Google Cloud.",
+    },
+    {
+        "id": "4",
+        "flags": [],
+        "sender": "The Pragmatic Newsletter <news@pragmatic.dev>",
+        "reply_to": "",
+        "message_id": "<pragmatic-84@pragmatic.dev>",
+        "references": "",
+        "subject": "Issue #84: Why Terminal TUIs are Making a Huge Comeback",
+        "date": "Oct 30 11:30",
+        "body": "In this week's issue:\n- The revival of minimalist terminal-first tooling\n- Fast keyboard-driven workflows\n- Building resilient CLI tools with standard libraries\n\nRead the full article online at pragmatic.dev/issue-84",
+    },
+    {
+        "id": "5",
+        "flags": ["\\Seen"],
+        "sender": "FedEx Delivery <tracking@fedex.com>",
+        "reply_to": "",
+        "message_id": "<fedex-pkg-982@fedex.com>",
+        "references": "",
+        "subject": "Your package is scheduled for delivery tomorrow",
+        "date": "Oct 29 20:10",
+        "body": "Track your package #9823481023.\nEstimated delivery: Tomorrow by 4:00 PM.\nSignature required: No.",
+    },
+]
+
+# ==============================================================================
+# Gmail Client Backend
+# ==============================================================================
+
+class GmailBackend:
+    def __init__(self, cfg=None, demo=False):
+        self.demo = demo
+        self.cfg = cfg
+        self.imap = None
+        self.folders = [
+            ("INBOX", "Inbox"),
+            ("[Gmail]/Starred", "Starred"),
+            ("[Gmail]/Sent Mail", "Sent"),
+            ("[Gmail]/Drafts", "Drafts"),
+            ("[Gmail]/Trash", "Trash"),
+            ("[Gmail]/All Mail", "All Mail"),
+        ]
+        self.current_folder = "INBOX"
+
+    def connect(self):
+        if self.demo:
+            return True
+        try:
+            context = ssl.create_default_context()
+            self.imap = imaplib.IMAP4_SSL(self.cfg["imap_host"], self.cfg["imap_port"], ssl_context=context)
+            self.imap.login(self.cfg["email"], self.cfg["app_password"])
+            return True
+        except Exception:
+            return False
+
+    def get_messages(self, folder="INBOX", limit=35):
+        if self.demo:
+            return list(DEMO_EMAILS)
+
+        self.current_folder = folder
+        try:
+            status, _ = self.imap.select(f'"{folder}"')
+            if status != "OK":
+                return []
+            _, data = self.imap.search(None, "ALL")
+            msg_ids = data[0].split()
+            if not msg_ids:
+                return []
+
+            msg_ids = msg_ids[-limit:][::-1]
+            results = []
+
+            for mid in msg_ids:
+                _, mdata = self.imap.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REPLY-TO REFERENCES)] FLAGS)")
+                if not mdata or not mdata[0]:
+                    continue
+
+                raw_header = mdata[0][1]
+                flags_part = mdata[0][0].decode("utf-8", errors="ignore")
+                flags = []
+                if "\\Seen" in flags_part:
+                    flags.append("\\Seen")
+                if "\\Flagged" in flags_part:
+                    flags.append("\\Flagged")
+
+                msg = email.message_from_bytes(raw_header)
+                subj = decode_mime_words(msg.get("Subject", "(No Subject)"))
+                from_ = decode_mime_words(msg.get("From", "(Unknown Sender)"))
+                date_ = decode_mime_words(msg.get("Date", ""))
+                reply_to = decode_mime_words(msg.get("Reply-To", ""))
+                msg_id = msg.get("Message-ID", "")
+                references = msg.get("References", "")
+
+                parsed_date = email.utils.parsedate_to_datetime(date_) if date_ else None
+                formatted_date = parsed_date.strftime("%b %d %H:%M") if parsed_date else date_[:16]
+
+                results.append({
+                    "id": mid.decode("utf-8"),
+                    "flags": flags,
+                    "sender": from_,
+                    "reply_to": reply_to,
+                    "message_id": msg_id,
+                    "references": references,
+                    "subject": subj,
+                    "date": formatted_date,
+                    "body": None
+                })
+            return results
+        except Exception:
+            return []
+
+    def get_unread_messages(self, folder="INBOX", limit=20):
+        if self.demo:
+            return [m for m in DEMO_EMAILS if "\\Seen" not in m["flags"]][:limit]
+
+        self.current_folder = folder
+        try:
+            status, _ = self.imap.select(f'"{folder}"')
+            if status != "OK":
+                return []
+            _, data = self.imap.search(None, "UNSEEN")
+            msg_ids = data[0].split()
+            if not msg_ids:
+                return []
+
+            msg_ids = msg_ids[-limit:][::-1]
+            results = []
+
+            for mid in msg_ids:
+                _, mdata = self.imap.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REPLY-TO REFERENCES)] FLAGS)")
+                if not mdata or not mdata[0]:
+                    continue
+
+                raw_header = mdata[0][1]
+                flags_part = mdata[0][0].decode("utf-8", errors="ignore")
+                flags = []
+                if "\\Seen" in flags_part:
+                    flags.append("\\Seen")
+                if "\\Flagged" in flags_part:
+                    flags.append("\\Flagged")
+
+                msg = email.message_from_bytes(raw_header)
+                subj = decode_mime_words(msg.get("Subject", "(No Subject)"))
+                from_ = decode_mime_words(msg.get("From", "(Unknown Sender)"))
+                date_ = decode_mime_words(msg.get("Date", ""))
+                reply_to = decode_mime_words(msg.get("Reply-To", ""))
+                msg_id = msg.get("Message-ID", "")
+                references = msg.get("References", "")
+
+                parsed_date = email.utils.parsedate_to_datetime(date_) if date_ else None
+                formatted_date = parsed_date.strftime("%b %d %H:%M") if parsed_date else date_[:16]
+
+                results.append({
+                    "id": mid.decode("utf-8"),
+                    "flags": flags,
+                    "sender": from_,
+                    "reply_to": reply_to,
+                    "message_id": msg_id,
+                    "references": references,
+                    "subject": subj,
+                    "date": formatted_date,
+                    "body": None
+                })
+            return results
+        except Exception:
+            return []
+
+    def fetch_body(self, folder, msg_id):
+        if self.demo:
+            for item in DEMO_EMAILS:
+                if str(item["id"]) == str(msg_id):
+                    return item.get("body", "")
+            return "Demo body"
+        try:
+            self.imap.select(f'"{folder}"')
+            _, data = self.imap.fetch(str(msg_id).encode("utf-8"), "(RFC822)")
+            raw_email = data[0][1]
+            msg = email.message_from_bytes(raw_email)
+            return extract_body(msg)
+        except Exception as e:
+            return f"Error loading email body: {e}"
+
+    def get_message_detail(self, folder, msg_id):
+        if self.demo:
+            for item in DEMO_EMAILS:
+                if str(item["id"]) == str(msg_id):
+                    return dict(item)
+            return None
+
+        try:
+            self.imap.select(f'"{folder}"')
+            _, data = self.imap.fetch(str(msg_id).encode("utf-8"), "(RFC822 FLAGS)")
+            if not data or not data[0]:
+                return None
+            raw_email = data[0][1]
+            flags_part = data[0][0].decode("utf-8", errors="ignore") if isinstance(data[0][0], bytes) else ""
+            flags = []
+            if "\\Seen" in flags_part:
+                flags.append("\\Seen")
+            if "\\Flagged" in flags_part:
+                flags.append("\\Flagged")
+
+            msg = email.message_from_bytes(raw_email)
+            subj = decode_mime_words(msg.get("Subject", "(No Subject)"))
+            from_ = decode_mime_words(msg.get("From", "(Unknown Sender)"))
+            date_ = decode_mime_words(msg.get("Date", ""))
+            reply_to = decode_mime_words(msg.get("Reply-To", ""))
+            msg_id_header = msg.get("Message-ID", "")
+            references = msg.get("References", "")
+            body = extract_body(msg)
+
+            parsed_date = email.utils.parsedate_to_datetime(date_) if date_ else None
+            formatted_date = parsed_date.strftime("%b %d %H:%M") if parsed_date else date_[:16]
+
+            return {
+                "id": str(msg_id),
+                "flags": flags,
+                "sender": from_,
+                "reply_to": reply_to,
+                "message_id": msg_id_header,
+                "references": references,
+                "subject": subj,
+                "date": formatted_date,
+                "body": body
+            }
+        except Exception:
+            return None
+
+    def toggle_flag(self, folder, msg_id, flag="\\Seen"):
+        if self.demo:
+            for item in DEMO_EMAILS:
+                if str(item["id"]) == str(msg_id):
+                    if flag in item["flags"]:
+                        item["flags"].remove(flag)
+                    else:
+                        item["flags"].append(flag)
+            return
+        try:
+            self.imap.select(f'"{folder}"')
+            status, data = self.imap.fetch(str(msg_id).encode("utf-8"), "(FLAGS)")
+            flags_str = data[0].decode("utf-8") if data and data[0] else ""
+            action = "-FLAGS" if flag in flags_str else "+FLAGS"
+            self.imap.store(str(msg_id).encode("utf-8"), action, flag)
+        except Exception:
+            pass
+
+    def set_flag(self, folder, msg_ids, flag="\\Seen", remove=False):
+        if not msg_ids:
+            return
+        if isinstance(msg_ids, (str, int)):
+            msg_ids = [str(msg_ids)]
+        else:
+            msg_ids = [str(mid) for mid in msg_ids]
+
+        if self.demo:
+            for item in DEMO_EMAILS:
+                if str(item["id"]) in msg_ids:
+                    if remove and flag in item["flags"]:
+                        item["flags"].remove(flag)
+                    elif not remove and flag not in item["flags"]:
+                        item["flags"].append(flag)
+            return
+
+        try:
+            self.imap.select(f'"{folder}"')
+            id_str = ",".join(msg_ids)
+            action = "-FLAGS" if remove else "+FLAGS"
+            self.imap.store(id_str, action, flag)
+        except Exception:
+            pass
+
+    def move_to_trash(self, folder, msg_id):
+        if isinstance(msg_id, (list, tuple, set)):
+            target_ids = [str(m) for m in msg_id]
+        else:
+            target_ids = [str(msg_id)]
+
+        if self.demo:
+            global DEMO_EMAILS
+            DEMO_EMAILS = [m for m in DEMO_EMAILS if str(m["id"]) not in target_ids]
+            return
+        try:
+            self.imap.select(f'"{folder}"')
+            id_str = ",".join(target_ids)
+            self.imap.copy(id_str, '"[Gmail]/Trash"')
+            self.imap.store(id_str, "+FLAGS", "\\Deleted")
+            self.imap.expunge()
+        except Exception:
+            pass
+
+    def send_email(self, to_addr, subject, body, in_reply_to=None, references=None):
+        if self.demo:
+            now_str = email.utils.formatdate(localtime=True)
+            new_id = str(len(DEMO_EMAILS) + 1)
+            new_msg = {
+                "id": new_id,
+                "flags": ["\\Seen"],
+                "sender": f"Me <{self.cfg.get('email', 'me@gmail.com') if self.cfg else 'me@gmail.com'}>",
+                "reply_to": "",
+                "message_id": f"<{new_id}@gmail.mock>",
+                "references": references or "",
+                "subject": subject,
+                "date": now_str[5:16],
+                "body": body,
+            }
+            DEMO_EMAILS.insert(0, new_msg)
+            return True, "Email sent successfully (Demo Mode)."
+
+        if not self.cfg or not self.cfg.get("email") or not self.cfg.get("app_password"):
+            return False, "Gmail credentials not configured."
+
+        try:
+            msg = EmailMessage()
+            msg["From"] = self.cfg["email"]
+            msg["To"] = to_addr
+            msg["Subject"] = subject
+            if in_reply_to:
+                msg["In-Reply-To"] = in_reply_to
+            if references:
+                msg["References"] = references
+            msg.set_content(body)
+
+            smtp_host = self.cfg.get("smtp_host", "smtp.gmail.com")
+            smtp_port = int(self.cfg.get("smtp_port", 465))
+            context = ssl.create_default_context()
+
+            if smtp_port == 465:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=20) as server:
+                    server.login(self.cfg["email"], self.cfg["app_password"])
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                    server.starttls(context=context)
+                    server.login(self.cfg["email"], self.cfg["app_password"])
+                    server.send_message(msg)
+            return True, "Email sent successfully!"
+        except Exception as e:
+            return False, f"Failed to send email: {e}"
+
+    def reply_to_message(self, msg_id, reply_text, folder="INBOX", quote=True, custom_subject=None):
+        detail = self.get_message_detail(folder, msg_id)
+        if not detail:
+            return False, f"Message ID '{msg_id}' not found in folder '{folder}'."
+
+        raw_to = detail.get("reply_to") or detail.get("sender") or ""
+        _, addr = email.utils.parseaddr(raw_to)
+        recipient = addr if addr else raw_to
+        if not recipient:
+            return False, f"Could not determine recipient email address from message {msg_id}."
+
+        if custom_subject:
+            subject = custom_subject
+        else:
+            orig_subj = detail.get("subject", "").strip()
+            if orig_subj.lower().startswith("re:"):
+                subject = orig_subj
+            else:
+                subject = f"Re: {orig_subj}" if orig_subj else "Re:"
+
+        if quote:
+            orig_date = detail.get("date", "")
+            orig_from = detail.get("sender", "")
+            raw_body = detail.get("body") or ""
+            quote_intro = f"On {orig_date}, {orig_from} wrote:"
+            quoted_lines = "\n".join(f"> {line}" for line in raw_body.splitlines())
+            full_body = f"{reply_text}\n\n{quote_intro}\n{quoted_lines}"
+        else:
+            full_body = reply_text
+
+        in_reply_to = detail.get("message_id")
+        orig_refs = detail.get("references", "")
+        if orig_refs and in_reply_to:
+            references = f"{orig_refs} {in_reply_to}".strip()
+        elif in_reply_to:
+            references = in_reply_to
+        else:
+            references = None
+
+        return self.send_email(
+            to_addr=recipient,
+            subject=subject,
+            body=full_body,
+            in_reply_to=in_reply_to,
+            references=references
+        )
+
+# ==============================================================================
+# Curses Text User Interface
+# ==============================================================================
+
+class GmailTUI:
+    def __init__(self, stdscr, backend):
+        self.stdscr = stdscr
+        self.backend = backend
+        self.folder_idx = 0
+        self.emails = []
+        self.selected_idx = 0
+        self.scroll_offset = 0
+        self.view_mode = "LIST"  # LIST, READER, COMPOSE, FOLDERS, HELP
+        self.current_email = None
+        self.reader_scroll = 0
+        self.status_msg = "Ready."
+        self.search_query = ""
+
+        # Compose & Reply State
+        self.compose_to = ""
+        self.compose_subject = ""
+        self.compose_body = [""]
+        self.compose_focus = "to"  # "to", "subject", "body"
+        self.compose_to_cursor = 0
+        self.compose_subj_cursor = 0
+        self.compose_body_cursor_y = 0
+        self.compose_body_cursor_x = 0
+        self.compose_scroll_y = 0
+        self.compose_in_reply_to = None
+        self.compose_references = None
+        self.compose_return_mode = "LIST"
+
+    def init_colors(self):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(5, curses.COLOR_CYAN, -1)
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+
+    def run(self):
+        self.init_colors()
+        curses.curs_set(0)
+        self.stdscr.nodelay(False)
+        self.stdscr.keypad(True)
+
+        self.status_msg = "Fetching emails..."
+        self.render()
+        self.refresh_emails()
+        self.status_msg = f"Loaded {len(self.emails)} messages."
+
+        while True:
+            self.render()
+            try:
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                break
+
+            if key == curses.KEY_RESIZE:
+                continue
+
+            if self.view_mode == "LIST":
+                if not self.handle_list_keys(key):
+                    break
+            elif self.view_mode == "READER":
+                self.handle_reader_keys(key)
+            elif self.view_mode == "COMPOSE":
+                self.handle_compose_keys(key)
+            elif self.view_mode == "HELP":
+                if key in (ord('q'), 27, ord('?'), ord(' ')):
+                    self.view_mode = "LIST"
+            elif self.view_mode == "FOLDERS":
+                self.handle_folder_keys(key)
+
+    def refresh_emails(self):
+        folder_internal, _ = self.backend.folders[self.folder_idx]
+        self.emails = self.backend.get_messages(folder_internal)
+        self.selected_idx = 0
+        self.scroll_offset = 0
+
+    def get_filtered_emails(self):
+        if not self.search_query:
+            return self.emails
+        q = self.search_query.lower()
+        return [
+            m for m in self.emails
+            if q in m["subject"].lower() or q in m["sender"].lower()
+        ]
+
+    # --------------------------------------------------------------------------
+    # List Mode Key Handling
+    # --------------------------------------------------------------------------
+
+    def handle_list_keys(self, key):
+        items = self.get_filtered_emails()
+        count = len(items)
+
+        if key in (ord('q'), 27):
+            if self.search_query:
+                self.search_query = ""
+                self.status_msg = "Search cleared."
+            else:
+                return False
+        elif key in (curses.KEY_UP, ord('k')):
+            if self.selected_idx > 0:
+                self.selected_idx -= 1
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if self.selected_idx < count - 1:
+                self.selected_idx += 1
+        elif key == ord('g'):
+            self.selected_idx = 0
+        elif key == ord('G'):
+            self.selected_idx = max(0, count - 1)
+        elif key == curses.KEY_PPAGE:
+            self.selected_idx = max(0, self.selected_idx - 10)
+        elif key == curses.KEY_NPAGE:
+            self.selected_idx = min(max(0, count - 1), self.selected_idx + 10)
+        elif key in (curses.KEY_ENTER, 10, 13, ord('o')):
+            if count > 0:
+                self.current_email = items[self.selected_idx]
+                self.status_msg = "Fetching email content..."
+                self.render()
+                folder_internal, _ = self.backend.folders[self.folder_idx]
+                self.current_email["body"] = self.backend.fetch_body(folder_internal, self.current_email["id"])
+                if "\\Seen" not in self.current_email["flags"]:
+                    self.backend.toggle_flag(folder_internal, self.current_email["id"], "\\Seen")
+                    self.current_email["flags"].append("\\Seen")
+                self.reader_scroll = 0
+                self.view_mode = "READER"
+        elif key == ord('c'):
+            self.start_compose()
+        elif key == ord('r'):
+            if count > 0:
+                self.start_reply(items[self.selected_idx])
+        elif key in (ord('R'), 18):
+            self.status_msg = "Refreshing..."
+            self.render()
+            self.refresh_emails()
+            self.status_msg = "Mailbox refreshed."
+        elif key == ord('u'):
+            if count > 0:
+                curr = items[self.selected_idx]
+                folder_internal, _ = self.backend.folders[self.folder_idx]
+                self.backend.toggle_flag(folder_internal, curr["id"], "\\Seen")
+                self.status_msg = "Toggled Read/Unread."
+        elif key == ord('s'):
+            if count > 0:
+                curr = items[self.selected_idx]
+                folder_internal, _ = self.backend.folders[self.folder_idx]
+                self.backend.toggle_flag(folder_internal, curr["id"], "\\Flagged")
+                self.status_msg = "Toggled Star."
+        elif key == ord('d'):
+            if count > 0:
+                curr = items[self.selected_idx]
+                folder_internal, _ = self.backend.folders[self.folder_idx]
+                self.backend.move_to_trash(folder_internal, curr["id"])
+                self.emails = [m for m in self.emails if m["id"] != curr["id"]]
+                if self.selected_idx >= len(self.get_filtered_emails()):
+                    self.selected_idx = max(0, len(self.get_filtered_emails()) - 1)
+                self.status_msg = "Moved email to Trash."
+        elif key in (ord('f'), 9):
+            self.view_mode = "FOLDERS"
+        elif key == ord('/'):
+            self.prompt_search()
+        elif key == ord('?'):
+            self.view_mode = "HELP"
+        return True
+
+    # --------------------------------------------------------------------------
+    # Reader Mode Key Handling
+    # --------------------------------------------------------------------------
+
+    def handle_reader_keys(self, key):
+        if key in (ord('q'), 27, ord('b')):
+            self.view_mode = "LIST"
+            self.status_msg = "Ready."
+        elif key == ord('r'):
+            self.start_reply(self.current_email)
+        elif key == ord('c'):
+            self.start_compose()
+        elif key in (curses.KEY_UP, ord('k')):
+            self.reader_scroll = max(0, self.reader_scroll - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            self.reader_scroll += 1
+        elif key == curses.KEY_PPAGE:
+            self.reader_scroll = max(0, self.reader_scroll - 15)
+        elif key == curses.KEY_NPAGE:
+            self.reader_scroll += 15
+        elif key == ord('g'):
+            self.reader_scroll = 0
+        elif key == ord('u'):
+            folder_internal, _ = self.backend.folders[self.folder_idx]
+            self.backend.toggle_flag(folder_internal, self.current_email["id"], "\\Seen")
+            self.status_msg = "Marked as unread."
+            self.view_mode = "LIST"
+        elif key == ord('d'):
+            folder_internal, _ = self.backend.folders[self.folder_idx]
+            self.backend.move_to_trash(folder_internal, self.current_email["id"])
+            self.emails = [m for m in self.emails if m["id"] != self.current_email["id"]]
+            self.status_msg = "Moved to Trash."
+            self.view_mode = "LIST"
+        elif key == ord('?'):
+            self.view_mode = "HELP"
+
+    # --------------------------------------------------------------------------
+    # Folder Mode Key Handling
+    # --------------------------------------------------------------------------
+
+    def handle_folder_keys(self, key):
+        if key in (ord('q'), 27):
+            self.view_mode = "LIST"
+        elif key in (curses.KEY_UP, ord('k')):
+            self.folder_idx = (self.folder_idx - 1) % len(self.backend.folders)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            self.folder_idx = (self.folder_idx + 1) % len(self.backend.folders)
+        elif key in (curses.KEY_ENTER, 10, 13, ord(' ')):
+            self.view_mode = "LIST"
+            self.status_msg = f"Opening {self.backend.folders[self.folder_idx][1]}..."
+            self.render()
+            self.refresh_emails()
+            self.status_msg = f"Opened {self.backend.folders[self.folder_idx][1]}."
+
+    # --------------------------------------------------------------------------
+    # Compose & Reply Management
+    # --------------------------------------------------------------------------
+
+    def start_compose(self):
+        self.compose_to = ""
+        self.compose_subject = ""
+        self.compose_body = [""]
+        self.compose_focus = "to"
+        self.compose_to_cursor = 0
+        self.compose_subj_cursor = 0
+        self.compose_body_cursor_y = 0
+        self.compose_body_cursor_x = 0
+        self.compose_scroll_y = 0
+        self.compose_in_reply_to = None
+        self.compose_references = None
+        self.compose_return_mode = self.view_mode if self.view_mode in ("LIST", "READER") else "LIST"
+        self.view_mode = "COMPOSE"
+        self.status_msg = "Compose: Tab switches field | Ctrl+S sends | Ctrl+E opens $EDITOR (nvim)"
+
+    def start_reply(self, email_item):
+        if not email_item:
+            return
+        folder_internal, _ = self.backend.folders[self.folder_idx]
+        if not email_item.get("body"):
+            self.status_msg = "Loading message body for reply..."
+            self.render()
+            email_item["body"] = self.backend.fetch_body(folder_internal, email_item["id"])
+
+        raw_to = email_item.get("reply_to") or email_item.get("sender") or ""
+        _, addr = email.utils.parseaddr(raw_to)
+        recipient = addr if addr else raw_to
+
+        orig_subj = email_item.get("subject", "").strip()
+        if orig_subj.lower().startswith("re:"):
+            subj = orig_subj
+        else:
+            subj = f"Re: {orig_subj}" if orig_subj else "Re:"
+
+        orig_date = email_item.get("date", "")
+        orig_from = email_item.get("sender", "")
+        raw_body = email_item.get("body") or ""
+        quote_intro = f"On {orig_date}, {orig_from} wrote:"
+        quoted_lines = [f"> {line}" for line in raw_body.splitlines()]
+
+        self.compose_to = recipient
+        self.compose_subject = subj
+        self.compose_body = ["", "", quote_intro] + (quoted_lines if quoted_lines else ["> "])
+        self.compose_focus = "body"
+        self.compose_to_cursor = len(recipient)
+        self.compose_subj_cursor = len(subj)
+        self.compose_body_cursor_y = 0
+        self.compose_body_cursor_x = 0
+        self.compose_scroll_y = 0
+        self.compose_in_reply_to = email_item.get("message_id")
+        orig_refs = email_item.get("references", "")
+        msg_id = email_item.get("message_id", "")
+        if orig_refs and msg_id:
+            self.compose_references = f"{orig_refs} {msg_id}".strip()
+        elif msg_id:
+            self.compose_references = msg_id
+        else:
+            self.compose_references = None
+
+        self.compose_return_mode = self.view_mode if self.view_mode in ("LIST", "READER") else "LIST"
+        self.view_mode = "COMPOSE"
+        self.status_msg = f"Replying to {recipient} | Ctrl+S sends | Ctrl+E opens $EDITOR"
+
+    def open_external_editor(self):
+        initial_text = "\n".join(self.compose_body)
+        new_text = launch_external_editor(initial_text)
+        new_lines = new_text.splitlines()
+        self.compose_body = new_lines if new_lines else [""]
+        self.compose_body_cursor_y = min(self.compose_body_cursor_y, len(self.compose_body) - 1)
+        self.compose_body_cursor_x = min(self.compose_body_cursor_x, len(self.compose_body[self.compose_body_cursor_y]))
+        self.compose_scroll_y = max(0, self.compose_body_cursor_y - 5)
+        self.status_msg = "Updated message from editor. Press Ctrl+S to Send."
+
+    def send_compose(self):
+        to_addr = self.compose_to.strip()
+        if not to_addr or "@" not in to_addr:
+            self.status_msg = "Error: Recipient email address is missing or invalid."
+            return
+
+        subject = self.compose_subject.strip()
+        body = "\n".join(self.compose_body)
+
+        self.status_msg = f"Sending email to {to_addr}..."
+        self.render()
+
+        success, msg = self.backend.send_email(
+            to_addr=to_addr,
+            subject=subject,
+            body=body,
+            in_reply_to=self.compose_in_reply_to,
+            references=self.compose_references
+        )
+
+        if success:
+            self.status_msg = msg
+            self.view_mode = "LIST"
+            self.refresh_emails()
+        else:
+            self.status_msg = f"Error: {msg}"
+
+    def confirm_cancel_compose(self):
+        has_user_text = (
+            (self.compose_to and self.compose_return_mode != "READER") or
+            (self.compose_subject and not self.compose_subject.startswith("Re:")) or
+            any(line.strip() and not line.startswith(">") for line in self.compose_body)
+        )
+        if has_user_text:
+            h, w = self.stdscr.getmaxyx()
+            self.stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+            prompt = " Discard draft? [y/N]: "
+            self.stdscr.addstr(h - 1, 0, prompt.ljust(w - 1)[:w - 1])
+            self.stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+            self.stdscr.refresh()
+            ch = self.stdscr.getch()
+            if ch not in (ord('y'), ord('Y')):
+                self.status_msg = "Draft preserved."
+                return
+        self.view_mode = self.compose_return_mode
+        self.status_msg = "Compose cancelled."
+
+    def handle_compose_keys(self, key):
+        if key in (19, 4, 24, curses.KEY_F10):
+            self.send_compose()
+            return
+        if key == 5:
+            self.open_external_editor()
+            return
+        if key in (27, 17):
+            self.confirm_cancel_compose()
+            return
+
+        if key in (9, ord('\t'), 14):
+            if self.compose_focus == "to":
+                self.compose_focus = "subject"
+            elif self.compose_focus == "subject":
+                self.compose_focus = "body"
+            elif self.compose_focus == "body":
+                if key in (9, ord('\t')):
+                    self.insert_body_tab()
+                else:
+                    self.compose_focus = "to"
+            return
+        elif key in (curses.KEY_BTAB, 353, 16):
+            if self.compose_focus == "body":
+                self.compose_focus = "subject"
+            elif self.compose_focus == "subject":
+                self.compose_focus = "to"
+            elif self.compose_focus == "to":
+                self.compose_focus = "body"
+            return
+
+        if self.compose_focus == "to":
+            self.handle_single_line_key("to", key)
+        elif self.compose_focus == "subject":
+            self.handle_single_line_key("subject", key)
+        elif self.compose_focus == "body":
+            self.handle_body_key(key)
+
+    def handle_single_line_key(self, field, key):
+        text = self.compose_to if field == "to" else self.compose_subject
+        cursor = self.compose_to_cursor if field == "to" else self.compose_subj_cursor
+
+        if key in (curses.KEY_ENTER, 10, 13, curses.KEY_DOWN):
+            if field == "to":
+                self.compose_focus = "subject"
+            else:
+                self.compose_focus = "body"
+            return
+        elif key == curses.KEY_UP:
+            if field == "subject":
+                self.compose_focus = "to"
+            return
+        elif key in (curses.KEY_LEFT,):
+            cursor = max(0, cursor - 1)
+        elif key in (curses.KEY_RIGHT,):
+            cursor = min(len(text), cursor + 1)
+        elif key in (curses.KEY_HOME, 1):
+            cursor = 0
+        elif key in (curses.KEY_END,):
+            cursor = len(text)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if cursor > 0:
+                text = text[:cursor - 1] + text[cursor:]
+                cursor -= 1
+        elif key == curses.KEY_DC:
+            if cursor < len(text):
+                text = text[:cursor] + text[cursor + 1:]
+        elif 32 <= key <= 126 or (key >= 160 and key < 65536):
+            char = chr(key)
+            text = text[:cursor] + char + text[cursor:]
+            cursor += 1
+
+        if field == "to":
+            self.compose_to = text
+            self.compose_to_cursor = cursor
+        else:
+            self.compose_subject = text
+            self.compose_subj_cursor = cursor
+
+    def insert_body_tab(self):
+        line = self.compose_body[self.compose_body_cursor_y]
+        cx = self.compose_body_cursor_x
+        self.compose_body[self.compose_body_cursor_y] = line[:cx] + "    " + line[cx:]
+        self.compose_body_cursor_x += 4
+
+    def handle_body_key(self, key):
+        cy = self.compose_body_cursor_y
+        cx = self.compose_body_cursor_x
+        lines = self.compose_body
+
+        if key in (curses.KEY_ENTER, 10, 13):
+            line = lines[cy]
+            lines[cy] = line[:cx]
+            lines.insert(cy + 1, line[cx:])
+            self.compose_body_cursor_y += 1
+            self.compose_body_cursor_x = 0
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if cx > 0:
+                line = lines[cy]
+                lines[cy] = line[:cx - 1] + line[cx:]
+                self.compose_body_cursor_x -= 1
+            elif cy > 0:
+                prev_line = lines[cy - 1]
+                curr_line = lines[cy]
+                self.compose_body_cursor_x = len(prev_line)
+                lines[cy - 1] = prev_line + curr_line
+                del lines[cy]
+                self.compose_body_cursor_y -= 1
+        elif key == curses.KEY_DC:
+            line = lines[cy]
+            if cx < len(line):
+                lines[cy] = line[:cx] + line[cx + 1:]
+            elif cy < len(lines) - 1:
+                next_line = lines[cy + 1]
+                lines[cy] = line + next_line
+                del lines[cy + 1]
+        elif key == curses.KEY_LEFT:
+            if cx > 0:
+                self.compose_body_cursor_x -= 1
+            elif cy > 0:
+                self.compose_body_cursor_y -= 1
+                self.compose_body_cursor_x = len(lines[self.compose_body_cursor_y])
+        elif key == curses.KEY_RIGHT:
+            if cx < len(lines[cy]):
+                self.compose_body_cursor_x += 1
+            elif cy < len(lines) - 1:
+                self.compose_body_cursor_y += 1
+                self.compose_body_cursor_x = 0
+        elif key == curses.KEY_UP:
+            if cy > 0:
+                self.compose_body_cursor_y -= 1
+                self.compose_body_cursor_x = min(cx, len(lines[self.compose_body_cursor_y]))
+            else:
+                self.compose_focus = "subject"
+        elif key == curses.KEY_DOWN:
+            if cy < len(lines) - 1:
+                self.compose_body_cursor_y += 1
+                self.compose_body_cursor_x = min(cx, len(lines[self.compose_body_cursor_y]))
+        elif key in (curses.KEY_HOME, 1):
+            self.compose_body_cursor_x = 0
+        elif key == curses.KEY_END:
+            self.compose_body_cursor_x = len(lines[cy])
+        elif key == curses.KEY_PPAGE:
+            self.compose_body_cursor_y = max(0, cy - 10)
+            self.compose_body_cursor_x = min(cx, len(lines[self.compose_body_cursor_y]))
+        elif key == curses.KEY_NPAGE:
+            self.compose_body_cursor_y = min(len(lines) - 1, cy + 10)
+            self.compose_body_cursor_x = min(cx, len(lines[self.compose_body_cursor_y]))
+        elif 32 <= key <= 126 or (key >= 160 and key < 65536):
+            char = chr(key)
+            line = lines[cy]
+            lines[cy] = line[:cx] + char + line[cx:]
+            self.compose_body_cursor_x += 1
+
+    def prompt_search(self):
+        curses.curs_set(1)
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.addstr(h - 1, 0, " " * (w - 1))
+        self.stdscr.addstr(h - 1, 0, "Search query: ")
+        curses.echo()
+        query = self.stdscr.getstr(h - 1, 14, 60).decode("utf-8", errors="ignore").strip()
+        curses.noecho()
+        curses.curs_set(0)
+        self.search_query = query
+        self.selected_idx = 0
+        self.status_msg = f"Filter: '{query}'" if query else "Search cleared."
+
+    # --------------------------------------------------------------------------
+    # Rendering
+    # --------------------------------------------------------------------------
+
+    def render(self):
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        if h < 8 or w < 40:
+            self.stdscr.addstr(0, 0, "Terminal too small!")
+            self.stdscr.refresh()
+            return
+
+        if self.view_mode == "LIST":
+            curses.curs_set(0)
+            self.render_list_view(h, w)
+        elif self.view_mode == "READER":
+            curses.curs_set(0)
+            self.render_reader_view(h, w)
+        elif self.view_mode == "COMPOSE":
+            self.render_compose_view(h, w)
+        elif self.view_mode == "HELP":
+            curses.curs_set(0)
+            self.render_list_view(h, w)
+            self.render_help_modal(h, w)
+        elif self.view_mode == "FOLDERS":
+            curses.curs_set(0)
+            self.render_list_view(h, w)
+            self.render_folder_modal(h, w)
+
+        status_line = f" {self.status_msg} "
+        if self.backend.demo:
+            status_line = "[DEMO MODE] " + status_line
+        self.stdscr.attron(curses.color_pair(4))
+        self.stdscr.addstr(h - 1, 0, status_line.ljust(w - 1)[:w - 1])
+        self.stdscr.attroff(curses.color_pair(4))
+
+        self.stdscr.refresh()
+
+    def render_list_view(self, h, w):
+        _, folder_name = self.backend.folders[self.folder_idx]
+        title = f" Gmail: [{folder_name}] "
+        if self.search_query:
+            title += f"(Filter: '{self.search_query}') "
+
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addstr(0, 0, title.ljust(w - 1)[:w - 1])
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        header_text = f" {'ST':<3} | {'DATE':<12} | {'SENDER':<24} | {'SUBJECT'}"
+        self.stdscr.addstr(1, 0, header_text[:w - 1], curses.A_DIM)
+        self.stdscr.addstr(2, 0, "─" * (w - 1), curses.A_DIM)
+
+        items = self.get_filtered_emails()
+        list_h = h - 4
+
+        if self.selected_idx < self.scroll_offset:
+            self.scroll_offset = self.selected_idx
+        elif self.selected_idx >= self.scroll_offset + list_h:
+            self.scroll_offset = self.selected_idx - list_h + 1
+
+        visible = items[self.scroll_offset : self.scroll_offset + list_h]
+
+        if not visible:
+            self.stdscr.addstr(4, 4, "[No messages in this mailbox or filter]", curses.A_DIM)
+        else:
+            for i, email_item in enumerate(visible):
+                row = 3 + i
+                actual_idx = self.scroll_offset + i
+                is_selected = (actual_idx == self.selected_idx)
+
+                is_unread = "\\Seen" not in email_item["flags"]
+                is_starred = "\\Flagged" in email_item["flags"]
+
+                status_char = "●" if is_unread else " "
+                star_char = "★" if is_starred else " "
+
+                sender_clean = email_item["sender"].split("<")[0].strip().replace('"', '')[:22]
+                subject_clean = email_item["subject"]
+
+                prefix = f" {status_char}{star_char} | {email_item['date']:<12} | {sender_clean:<22} | "
+                row_str = (prefix + subject_clean).ljust(w - 1)[:w - 1]
+
+                if is_selected:
+                    self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                    self.stdscr.addstr(row, 0, row_str)
+                    self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                else:
+                    attr = curses.A_BOLD if is_unread else curses.A_NORMAL
+                    self.stdscr.addstr(row, 0, row_str, attr)
+
+        hint_text = " [Enter] Read  [c] Compose  [r] Reply  [R] Refresh  [f] Folders  [u] Unread  [s] Star  [d] Trash  [?] Help"
+        self.stdscr.addstr(h - 2, 0, hint_text.ljust(w - 1)[:w - 1], curses.A_DIM)
+
+    def render_reader_view(self, h, w):
+        e = self.current_email
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addstr(0, 0, " Gmail Message Reader ".ljust(w - 1)[:w - 1])
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        self.stdscr.addstr(1, 2, f"Subject: {e['subject']}"[:w - 4], curses.A_BOLD)
+        self.stdscr.addstr(2, 2, f"From:    {e['sender']}"[:w - 4], curses.color_pair(5))
+        self.stdscr.addstr(3, 2, f"Date:    {e['date']}"[:w - 4], curses.A_DIM)
+        self.stdscr.addstr(4, 0, "─" * (w - 1), curses.A_DIM)
+
+        body_lines = []
+        raw_body = e.get("body") or "[Empty Message]"
+        for para in raw_body.splitlines():
+            if not para.strip():
+                body_lines.append("")
+            else:
+                while len(para) > (w - 6):
+                    body_lines.append(para[:w - 6])
+                    para = para[w - 6:]
+                body_lines.append(para)
+
+        content_h = h - 7
+        visible_lines = body_lines[self.reader_scroll : self.reader_scroll + content_h]
+
+        for i, line in enumerate(visible_lines):
+            self.stdscr.addstr(5 + i, 2, line[:w - 4])
+
+        hint_text = " [q/Esc] Back  [r] Reply  [c] Compose  [j/k] Scroll  [u] Unread  [s] Star  [d] Trash  [?] Help"
+        self.stdscr.addstr(h - 2, 0, hint_text.ljust(w - 1)[:w - 1], curses.A_DIM)
+
+    def render_compose_view(self, h, w):
+        is_reply = bool(self.compose_in_reply_to)
+        title = " Gmail: [Reply Message] " if is_reply else " Gmail: [Compose New Message] "
+
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addstr(0, 0, title.ljust(w - 1)[:w - 1])
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # To field
+        to_label = " To:      "
+        to_attr = curses.color_pair(1) | curses.A_BOLD if self.compose_focus == "to" else curses.color_pair(5) | curses.A_BOLD
+        self.stdscr.addstr(2, 2, to_label, to_attr)
+        to_val = self.compose_to
+        to_w = max(10, w - 16)
+        if self.compose_to_cursor >= to_w:
+            visible_to = to_val[self.compose_to_cursor - to_w + 1 : self.compose_to_cursor + 1]
+            render_to_x = 2 + len(to_label) + len(visible_to) - 1
+        else:
+            visible_to = to_val[:to_w]
+            render_to_x = 2 + len(to_label) + self.compose_to_cursor
+        self.stdscr.addstr(2, 2 + len(to_label), visible_to.ljust(to_w)[:to_w], curses.A_UNDERLINE)
+
+        # Subject field
+        subj_label = " Subject: "
+        subj_attr = curses.color_pair(1) | curses.A_BOLD if self.compose_focus == "subject" else curses.color_pair(5) | curses.A_BOLD
+        self.stdscr.addstr(3, 2, subj_label, subj_attr)
+        subj_val = self.compose_subject
+        subj_w = max(10, w - 16)
+        if self.compose_subj_cursor >= subj_w:
+            visible_subj = subj_val[self.compose_subj_cursor - subj_w + 1 : self.compose_subj_cursor + 1]
+            render_subj_x = 2 + len(subj_label) + len(visible_subj) - 1
+        else:
+            visible_subj = subj_val[:subj_w]
+            render_subj_x = 2 + len(subj_label) + self.compose_subj_cursor
+        self.stdscr.addstr(3, 2 + len(subj_label), visible_subj.ljust(subj_w)[:subj_w], curses.A_UNDERLINE)
+
+        # Separator line
+        self.stdscr.addstr(4, 0, "─" * (w - 1), curses.A_DIM)
+
+        # Body area
+        body_start_y = 5
+        body_h = max(1, h - 8)
+
+        if self.compose_body_cursor_y < self.compose_scroll_y:
+            self.compose_scroll_y = self.compose_body_cursor_y
+        elif self.compose_body_cursor_y >= self.compose_scroll_y + body_h:
+            self.compose_scroll_y = self.compose_body_cursor_y - body_h + 1
+
+        body_lines = self.compose_body
+        for i in range(body_h):
+            line_idx = self.compose_scroll_y + i
+            y = body_start_y + i
+            if line_idx < len(body_lines):
+                line_content = body_lines[line_idx]
+                attr = curses.A_DIM if line_content.startswith(">") else curses.A_NORMAL
+                self.stdscr.addstr(y, 2, line_content[:w - 4], attr)
+
+        hint_text = " [Ctrl+S] Send  [Ctrl+E] Open $EDITOR (nvim)  [Tab] Next Field  [Esc] Cancel"
+        self.stdscr.addstr(h - 2, 0, hint_text.ljust(w - 1)[:w - 1], curses.A_DIM)
+
+        # Hardware cursor placement
+        if self.compose_focus == "to":
+            curses.curs_set(1)
+            self.stdscr.move(2, min(w - 2, render_to_x))
+        elif self.compose_focus == "subject":
+            curses.curs_set(1)
+            self.stdscr.move(3, min(w - 2, render_subj_x))
+        elif self.compose_focus == "body":
+            curses.curs_set(1)
+            rel_y = self.compose_body_cursor_y - self.compose_scroll_y
+            cur_y = body_start_y + rel_y
+            cur_x = 2 + self.compose_body_cursor_x
+            self.stdscr.move(min(h - 3, max(body_start_y, cur_y)), min(w - 2, cur_x))
+
+    def render_folder_modal(self, h, w):
+        modal_w = 40
+        modal_h = len(self.backend.folders) + 4
+        start_y = max(1, (h - modal_h) // 2)
+        start_x = max(1, (w - modal_w) // 2)
+
+        for y in range(modal_h):
+            self.stdscr.addstr(start_y + y, start_x, " " * modal_w, curses.color_pair(1))
+
+        self.stdscr.addstr(start_y + 1, start_x + 2, "Select Folder (j/k, Enter):", curses.color_pair(1) | curses.A_BOLD)
+
+        for idx, (_, name) in enumerate(self.backend.folders):
+            cursor = " \u25ba " if idx == self.folder_idx else "   "
+            line = f"{cursor}{name}"
+            attr = curses.A_REVERSE if idx == self.folder_idx else curses.A_NORMAL
+            self.stdscr.addstr(start_y + 3 + idx, start_x + 2, line.ljust(modal_w - 4), attr)
+
+    def render_help_modal(self, h, w):
+        modal_w = 58
+        modal_h = 18
+        start_y = max(1, (h - modal_h) // 2)
+        start_x = max(1, (w - modal_w) // 2)
+
+        for y in range(modal_h):
+            self.stdscr.addstr(start_y + y, start_x, " " * modal_w, curses.color_pair(1))
+
+        self.stdscr.addstr(start_y + 1, start_x + 2, "GMAIL TERMINAL SHORTCUTS", curses.color_pair(1) | curses.A_BOLD)
+
+        shortcuts = [
+            ("c", "Compose new email"),
+            ("r", "Reply to email (List & Reader)"),
+            ("Ctrl+S / Ctrl+D", "Send email in Compose view"),
+            ("Ctrl+E", "Edit draft in $EDITOR (nvim)"),
+            ("Enter / o", "Open and read email"),
+            ("j / k / Down / Up", "Navigate list / scroll reader"),
+            ("R", "Refresh mailbox"),
+            ("u", "Toggle Read / Unread"),
+            ("s", "Toggle Star / Flag"),
+            ("d", "Move to Trash"),
+            ("f / Tab", "Switch folder (Inbox/Sent/Trash)"),
+            ("/", "Search & filter by text"),
+            ("q / Esc", "Back / Quit"),
+        ]
+
+        for i, (key, desc) in enumerate(shortcuts):
+            row = f"  {key:<18} : {desc}"
+            self.stdscr.addstr(start_y + 3 + i, start_x + 1, row[:modal_w - 2], curses.color_pair(1))
+
+# ==============================================================================
+# Headless CLI Execution
+# ==============================================================================
+
+def get_body_text(arg_body):
+    if arg_body == "-":
+        return sys.stdin.read()
+    return arg_body or ""
+
+def handle_headless_cli(args, backend):
+    # 1. Unread emails
+    if args.unread:
+        messages = backend.get_unread_messages(folder=args.folder, limit=args.limit)
+        if args.json:
+            print(json.dumps({"count": len(messages), "folder": args.folder, "messages": messages}, indent=2))
+        else:
+            if not messages:
+                print(f"No unread messages in {args.folder}.")
+            else:
+                print(f"Unread messages in {args.folder} ({len(messages)}):")
+                print("-" * 75)
+                for m in messages:
+                    print(f"[{m['id']}] {m['date']} | {m['sender'][:25]:<25} | {m['subject']}")
+        return 0
+
+    # 2. List messages
+    if args.list:
+        messages = backend.get_messages(folder=args.folder, limit=args.limit)
+        if args.json:
+            print(json.dumps({"count": len(messages), "folder": args.folder, "messages": messages}, indent=2))
+        else:
+            if not messages:
+                print(f"No messages in {args.folder}.")
+            else:
+                print(f"Recent messages in {args.folder} ({len(messages)}):")
+                print("-" * 75)
+                for m in messages:
+                    status = "● " if "\\Seen" not in m["flags"] else "  "
+                    star = "★ " if "\\Flagged" in m["flags"] else "  "
+                    print(f"[{m['id']}] {status}{star}{m['date']} | {m['sender'][:25]:<25} | {m['subject']}")
+        return 0
+
+    # 3. Read specific email
+    if args.read:
+        detail = backend.get_message_detail(args.folder, args.read)
+        if not detail:
+            if args.json:
+                print(json.dumps({"error": f"Message ID '{args.read}' not found in folder '{args.folder}'."}, indent=2))
+            else:
+                print(f"Error: Message ID '{args.read}' not found in {args.folder}.", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(detail, indent=2))
+        else:
+            print(f"ID:       {detail['id']}")
+            print(f"From:     {detail['sender']}")
+            if detail.get('reply_to'):
+                print(f"Reply-To: {detail['reply_to']}")
+            print(f"Date:     {detail['date']}")
+            print(f"Subject:  {detail['subject']}")
+            print("-" * 75)
+            print(detail.get('body') or "[Empty Message]")
+        return 0
+
+    # 4. Reply to email
+    if args.reply:
+        body_text = get_body_text(args.body)
+        if not body_text.strip():
+            err = "Error: --body is required to reply (use '--body \"...\"' or '--body -' for stdin)."
+            if args.json:
+                print(json.dumps({"error": err}, indent=2))
+            else:
+                print(err, file=sys.stderr)
+            return 1
+
+        quote = not args.no_quote
+        success, msg = backend.reply_to_message(
+            msg_id=args.reply,
+            reply_text=body_text,
+            folder=args.folder,
+            quote=quote,
+            custom_subject=args.subject
+        )
+        if args.json:
+            print(json.dumps({"success": success, "message": msg, "id": args.reply}, indent=2))
+        else:
+            if success:
+                print(f"Success: {msg}")
+            else:
+                print(f"Error: {msg}", file=sys.stderr)
+        return 0 if success else 1
+
+    # 5. Send new email
+    if args.send:
+        if not args.to:
+            err = "Error: --to <recipient> is required to send an email."
+            if args.json:
+                print(json.dumps({"error": err}, indent=2))
+            else:
+                print(err, file=sys.stderr)
+            return 1
+
+        body_text = get_body_text(args.body)
+        subject = args.subject or "(No Subject)"
+        success, msg = backend.send_email(to_addr=args.to, subject=subject, body=body_text)
+        if args.json:
+            print(json.dumps({"success": success, "message": msg, "to": args.to, "subject": subject}, indent=2))
+        else:
+            if success:
+                print(f"Success: {msg}")
+            else:
+                print(f"Error: {msg}", file=sys.stderr)
+        return 0 if success else 1
+
+    # 6. Mark read / unread
+    if args.mark_read:
+        target_ids = args.mark_read
+        if "all" in target_ids:
+            unreads = backend.get_unread_messages(folder=args.folder, limit=100)
+            target_ids = [m["id"] for m in unreads]
+        backend.set_flag(args.folder, target_ids, flag="\\Seen", remove=False)
+        if args.json:
+            print(json.dumps({"success": True, "action": "mark_read", "ids": target_ids}, indent=2))
+        else:
+            print(f"Marked {len(target_ids)} message(s) as read: {', '.join(target_ids)}")
+        return 0
+
+    # 7. Trash
+    if args.trash:
+        target_ids = args.trash
+        backend.move_to_trash(args.folder, target_ids)
+        if args.json:
+            print(json.dumps({"success": True, "action": "trash", "ids": target_ids}, indent=2))
+        else:
+            print(f"Moved {len(target_ids)} message(s) to Trash: {', '.join(target_ids)}")
+        return 0
+
+    return None
+
+# ==============================================================================
+# CLI Entry Point & Terminal Setup
+# ==============================================================================
+
+def disable_flow_control():
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        new_attrs = termios.tcgetattr(fd)
+        new_attrs[0] &= ~termios.IXON
+        termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+        return old_attrs
+    except Exception:
+        return None
+
+def restore_flow_control(old_attrs):
+    if old_attrs:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Terminal & Headless CLI Gmail Client")
+    parser.add_argument("--demo", action="store_true", help="Launch or run in demo mode with sample emails")
+    parser.add_argument("--setup", action="store_true", help="Reconfigure Gmail account credentials")
+
+    # Headless CLI actions
+    cli_group = parser.add_argument_group("Headless CLI Commands")
+    cli_group.add_argument("--unread", action="store_true", help="List unread emails")
+    cli_group.add_argument("--list", action="store_true", help="List recent emails in a folder")
+    cli_group.add_argument("--folder", default="INBOX", help="Target folder (default: INBOX)")
+    cli_group.add_argument("--limit", type=int, default=20, help="Number of emails to return (default: 20)")
+    cli_group.add_argument("--read", metavar="MSG_ID", help="Read and print full details of an email by ID")
+    cli_group.add_argument("--reply", metavar="MSG_ID", help="Reply to an email by ID (requires --body)")
+    cli_group.add_argument("--send", action="store_true", help="Send a new email (requires --to, --subject, --body)")
+    cli_group.add_argument("--to", help="Recipient email address for --send")
+    cli_group.add_argument("--subject", help="Email subject for --send or custom reply subject")
+    cli_group.add_argument("--body", help="Email body text (or '-' to read from stdin)")
+    cli_group.add_argument("--no-quote", action="store_true", help="Do not quote original message in reply")
+    cli_group.add_argument("--mark-read", nargs="+", metavar="MSG_ID", help="Mark email(s) as read (accepts multiple IDs or 'all')")
+    cli_group.add_argument("--trash", nargs="+", metavar="MSG_ID", help="Move email(s) to Trash (accepts multiple IDs)")
+    cli_group.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    args = parser.parse_args()
+
+    cfg = load_config()
+
+    if args.setup:
+        cfg = interactive_setup()
+        if not cfg:
+            sys.exit(0)
+
+    # Check if a headless CLI action was requested
+    is_headless = any([
+        args.unread,
+        args.list,
+        args.read is not None,
+        args.reply is not None,
+        args.send,
+        args.mark_read is not None,
+        args.trash is not None,
+    ])
+
+    if args.demo:
+        backend = GmailBackend(demo=True)
+    elif cfg:
+        backend = GmailBackend(cfg=cfg, demo=False)
+        if not backend.connect():
+            err_msg = "Failed to authenticate with Gmail IMAP. Run 'gmail --setup' to update credentials, or use '--demo'."
+            if args.json:
+                print(json.dumps({"error": err_msg}, indent=2))
+            else:
+                print(err_msg, file=sys.stderr)
+            sys.exit(1)
+    else:
+        err_msg = "No Gmail account configured. Run 'gmail --setup' to configure, or pass '--demo' to test."
+        if is_headless:
+            if args.json:
+                print(json.dumps({"error": err_msg}, indent=2))
+            else:
+                print(err_msg, file=sys.stderr)
+            sys.exit(1)
+
+        print(err_msg)
+        print("\nChoose an option:")
+        print("  1) Configure Gmail Account (Setup Wizard)")
+        print("  2) Launch in Demo Mode (Preview UI with sample emails)")
+        print("  3) Exit\n")
+        choice = input("Enter choice [1/2/3]: ").strip()
+        if choice == "1":
+            cfg = interactive_setup()
+            if not cfg:
+                sys.exit(0)
+            backend = GmailBackend(cfg=cfg, demo=False)
+            backend.connect()
+        elif choice == "2":
+            backend = GmailBackend(demo=True)
+        else:
+            sys.exit(0)
+
+    # Handle Headless execution
+    if is_headless:
+        code = handle_headless_cli(args, backend)
+        sys.exit(code if code is not None else 0)
+
+    # Interactive Curses TUI
+    old_attrs = disable_flow_control()
+    try:
+        curses.wrapper(lambda stdscr: GmailTUI(stdscr, backend).run())
+    finally:
+        restore_flow_control(old_attrs)
+
+if __name__ == "__main__":
+    main()
